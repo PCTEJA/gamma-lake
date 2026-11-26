@@ -457,6 +457,10 @@ class TestGammaFeatureLake(GammaFeatureLakeTestsMixin):
 
         self._test_read_equivalence_multi_symbol(fs_factory, modes)
 
+    @pytest.mark.parametrize("overlap_mode", ["copy", "merge"])
+    def test_sequential_overwrite_in_preserved_range(self, overlap_mode, fs):
+        self._test_sequential_overwrite_in_preserved_range(fs, overlap_mode=overlap_mode)
+
     @pytest.mark.parametrize("use_remote_data,use_ray_cluster", [(True, True), (False, True), (False, False)])
     def test_runtime_computed_features(self, use_remote_data, use_ray_cluster, tmp_path):
         fs = GammaFeatureLake(base_path=str(tmp_path), run_on_ray_cluster=use_ray_cluster, enable_runtime_computed_features=True).initialize()

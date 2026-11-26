@@ -2589,6 +2589,137 @@ class GammaFeatureLakeTestsMixin:
         self.verify_index_alignment(fs)
         self.verify_delta_version_alignment(fs)
 
+    def _test_copy_overlap_preserves_untouched_values(self, fs: GammaFeatureLake):
+        """Regression test for Point72/gamma-lake #46: a copy-mode overwrite must only
+        change the overwritten rows.
+
+        Overwriting one row (day 2, symbol A) used to drop every value after the
+        overwritten range: the replacement table kept only rows before the overwrite,
+        so untouched rows read back as null. The replacement must instead keep every
+        existing row whose sort keys are not being overwritten.
+        """
+        start = datetime(2020, 1, 1, tzinfo=UTC)
+        days = [start + timedelta(days=i) for i in range(3)]
+        symbols = ["A", "B"]
+
+        def make_df(day_indices, syms, **features):
+            rows = [
+                {"timestamp": days[i], "symbol": s, **{name: float(scale * (i + 1)) for name, scale in features.items()}}
+                for i in day_indices
+                for s in syms
+            ]
+            return pl.DataFrame(rows).with_columns(pl.col("timestamp").cast(pl.Datetime("us", "UTC")))
+
+        fs.add_features(make_df([0, 1, 2], symbols, f1=1, f2=2))
+        addr_before = fs.feature_metadata_frame().collect().filter(pl.col("feature_name") == "f1")["table_addr"].unique().item()
+
+        # Overwrite f1 for a single row: day 2, symbol A.
+        fs.add_features(make_df([1], ["A"], f1=100), overlap_mode="copy")
+
+        # Copy mode must still create a new table on overlap.
+        fm = fs.feature_metadata_frame().collect()
+        addr_after = fm.filter(pl.col("feature_name") == "f1").sort("version", descending=True, nulls_last=True).head(1)["table_addr"].item()
+        assert addr_after != addr_before, "copy mode must create a new table_addr on overlap"
+
+        result = fs.read(["f1", "f2"]).sort(fs.sort_keys)
+        expected = (
+            make_df([0, 1, 2], symbols, f1=1, f2=2)
+            .with_columns(pl.when((pl.col("timestamp") == days[1]) & (pl.col("symbol") == "A")).then(200.0).otherwise(pl.col("f1")).alias("f1"))
+            .sort(fs.sort_keys)
+        )
+        assert_frame_equal(result, expected, check_column_order=False)
+
+        self.verify_index_alignment(fs)
+        self.verify_delta_version_alignment(fs)
+
+    def _test_copy_overlap_with_new_key_preserves_untouched_values(self, fs: GammaFeatureLake):
+        """Same partial overwrite as _test_copy_overlap_preserves_untouched_values, but the
+        copy write also adds a brand-new index row (day 4, symbol A).
+
+        This is the maintainer's follow-up case from the review of PR #47: the new key
+        must land exactly once, and the untouched rows must keep their values instead of
+        being duplicated as null alignment rows.
+        """
+        start = datetime(2020, 1, 1, tzinfo=UTC)
+        days = [start + timedelta(days=i) for i in range(4)]
+
+        def frame(rows, values):
+            return pl.DataFrame(
+                {
+                    "timestamp": [days[d] for d, _ in rows],
+                    "symbol": [s for _, s in rows],
+                    "f1": values,
+                }
+            ).with_columns(pl.col("timestamp").cast(pl.Datetime("us", "UTC")))
+
+        initial_rows = [(0, "A"), (0, "B"), (1, "A"), (1, "B"), (2, "A"), (2, "B")]
+        fs.add_features(frame(initial_rows, [1.0, 1.0, 2.0, 2.0, 3.0, 3.0]))
+        # Overwrite an existing key and add a new key in the same copy write.
+        fs.add_features(frame([(1, "A"), (3, "A")], [100.0, 4.0]), overlap_mode="copy")
+
+        result = fs.read(["f1"]).sort(fs.sort_keys)
+        expected = pl.DataFrame(
+            {
+                "timestamp": [days[0], days[0], days[1], days[1], days[2], days[2], days[3]],
+                "symbol": ["A", "B", "A", "B", "A", "B", "A"],
+                "f1": [1.0, 1.0, 100.0, 2.0, 3.0, 3.0, 4.0],
+            }
+        ).with_columns(pl.col("timestamp").cast(pl.Datetime("us", "UTC")))
+        assert_frame_equal(result, expected, check_column_order=False)
+
+        self.verify_index_alignment(fs)
+        self.verify_delta_version_alignment(fs)
+
+    def _test_sequential_overwrite_in_preserved_range(self, fs: GammaFeatureLake, overlap_mode: str):
+        """Regression test for the follow-up found in review of the #46 fix: a second
+        overwrite inside the range preserved by the first must not duplicate rows.
+
+        The replacement table keeps trailing rows, so its recorded last_updated must
+        be the table's true max key — not just the first write's input max — or the
+        second write takes the append branch and appends keys that already exist.
+        A third write then appends a new key past the preserved range.
+        """
+        start = datetime(2020, 1, 1, tzinfo=UTC)
+        days = [start + timedelta(days=i) for i in range(4)]
+
+        def frame(rows, values):
+            return pl.DataFrame(
+                {
+                    "timestamp": [days[d] for d, _ in rows],
+                    "symbol": [s for _, s in rows],
+                    "f1": values,
+                }
+            ).with_columns(pl.col("timestamp").cast(pl.Datetime("us", "UTC")))
+
+        initial_rows = [(0, "A"), (0, "B"), (1, "A"), (1, "B"), (2, "A"), (2, "B")]
+        fs.add_features(frame(initial_rows, [1.0, 1.0, 2.0, 2.0, 3.0, 3.0]))
+
+        # Merge nulls same-period symbols absent from the input ("complete replacement"
+        # semantics), while copy preserves them — so the expected values differ by mode,
+        # but neither mode may duplicate rows.
+        expected_after_two = [1.0, 1.0, 200.0, 2.0, 300.0, 3.0] if overlap_mode == "copy" else [1.0, 1.0, 200.0, None, 300.0, None]
+
+        # First overwrite: (2, A). The trailing day-3 rows must be preserved.
+        fs.add_features(frame([(1, "A")], [200.0]), overlap_mode=overlap_mode)
+        # Second overwrite, inside the preserved range: (3, A).
+        fs.add_features(frame([(2, "A")], [300.0]), overlap_mode=overlap_mode)
+
+        result = fs.read(["f1"]).sort(fs.sort_keys)
+        assert result.height == 6, f"sequential {overlap_mode} overwrites must not duplicate rows, got {result.height} rows"
+        assert result["f1"].to_list() == expected_after_two, (
+            f"sequential {overlap_mode} overwrites returned f1={result['f1'].to_list()}, expected {expected_after_two}"
+        )
+        self.verify_index_alignment(fs)
+        self.verify_delta_version_alignment(fs)
+
+        # Third write: a new key past the preserved range appends cleanly.
+        fs.add_features(frame([(3, "A")], [4.0]), overlap_mode=overlap_mode)
+        result = fs.read(["f1"]).sort(fs.sort_keys)
+        assert result.height == 7, f"append after preserved range must add exactly one row, got {result.height} rows"
+        assert result["f1"].to_list() == [*expected_after_two, 4.0], f"append after preserved range returned f1={result['f1'].to_list()}"
+        self.verify_index_alignment(fs)
+        self.verify_delta_version_alignment(fs)
+
     def _test_merge_feature_asof_colocated_not_aligned(self, fs: GammaFeatureLake):
         """Pitfall 6: a merge write on a regular feature must NOT inject null sentinels into an as-of table.
 

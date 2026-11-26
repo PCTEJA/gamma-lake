@@ -52,9 +52,9 @@ Step 1: Use rows existing in both the existing index and input frame, rows in th
         | I1     | V1       |           |        |          |           | I1     | V1       |
         | I2     | V2       |           |        |          |           | I2     | V2       |
         | I3     | V3       |           | I3     | V3'      |           | I3     | V3'      |
-        | I4     | V4       |           |        |          |    =>     | I4     | null     |
+        | I4     | V4       |           |        |          |    =>     | I4     | V4       |
         | I5     | V5       |           | I5     | V5'      |           | I5     | V5'      |
-        | I6     | V6       |           |        |          |           | I6     | null     |
+        | I6     | V6       |           |        |          |           | I6     | V6       |
         +-------------------+           | I7     | V7'      |           | I7     | V7'      |
                                         | I8     | V8'      |           | I8     | V8'      |
                                         | I9     | V9'      |           | I9     | V9'      |
@@ -236,9 +236,9 @@ def update_feature_tables(
         | I1     | V1       |           |        |          |           | I1     | V1       |
         | I2     | V2       |           |        |          |           | I2     | V2       |
         | I3     | V3       |           | I3     | V3'      |           | I3     | V3'      |
-        | I4     | V4       |           |        |          |    =>     | I4     | null     |
+        | I4     | V4       |           |        |          |    =>     | I4     | V4       |
         | I5     | V5       |           | I5     | V5'      |           | I5     | V5'      |
-        | I6     | V6       |           |        |          |           | I6     | null     |
+        | I6     | V6       |           |        |          |           | I6     | V6       |
         +-------------------+           | I7     | V7'      |           | I7     | V7'      |
                                         | I8     | V8'      |           | I8     | V8'      |
                                         | I9     | V9'      |           | I9     | V9'      |
@@ -299,6 +299,9 @@ def update_feature_tables(
         columns = feature_store.sort_keys + feature_df["feature_name"].to_list()
         last_updated = feature_store._get_last_updated(table_addr, table_metadata=table_metadata)
         feature_metadata_row = None
+        # last_updated must keep describing the table's true span after this write. The table
+        # never shrinks, so it is at least the larger of its previous span and the input range.
+        effective_last_updated = max(last_updated, input_comparable_max)
 
         if input_length == new_index_rows_ref.height:
             # All input rows are new to the index. Write them to the feature table directly, padding with missing index rows.
@@ -332,7 +335,16 @@ def update_feature_tables(
                     ).select(columns)
                     feature_store.io.merge_delta(overlap_df, source_path, on=feature_store.sort_keys, writer_properties=writer_props)
                 else:
-                    # copy mode: freeze old rows into the current table, write everything to a new address
+                    # copy mode: freeze old rows into the current table, write everything to a new address.
+                    # Capture the existing rows before appending new index rows to the old table, so the
+                    # replacement keeps every row the input does not overwrite — not just the rows before
+                    # the overwritten range — and the appended rows cannot leak back in as duplicates.
+                    old_features = (
+                        feature_store.io.scan_delta(source_path)
+                        .select(columns)
+                        .join(inner_join_ref.lazy().select(feature_store.sort_keys), how="anti", on=feature_store.sort_keys)
+                        .collect()
+                    )
                     new_index_rows_slice = new_index_rows_ref.filter(pl.col(pk) <= last_updated)
                     if new_index_rows_slice.height > 0:
                         feature_store.io.write_delta(
@@ -345,14 +357,21 @@ def update_feature_tables(
                                 "target_file_size": feature_store.target_file_size,
                             },
                         )
-                    old_features = feature_store.io.scan_delta(source_path).select(columns).filter(pl.col(pk) < input_comparable_min).collect()
                     alignment_rows = (
-                        missing_index_rows_ref.filter(pl.col(pk) >= last_updated)
-                        if (old_features.height > 0 and signal_type not in ("as_of_feature", "sparse_feature"))
+                        missing_index_rows_ref.filter(pl.col(pk) >= last_updated).join(
+                            old_features.select(feature_store.sort_keys), how="anti", on=feature_store.sort_keys
+                        )
+                        if signal_type not in ("as_of_feature", "sparse_feature")
                         else pl.DataFrame()
                     )
                     new_rows = pl.concat([inner_join_ref, new_index_rows_ref, alignment_rows], how="diagonal").select(columns)
                     table_addr = feature_store.gen_table_addr()
+                    # The replacement keeps the old table's trailing rows, so its span is the
+                    # old table's true max key, not just the input range — otherwise a later
+                    # write inside the preserved range would take the append branch and
+                    # duplicate keys that already exist.
+                    if old_features.height > 0:
+                        effective_last_updated = max(effective_last_updated, old_features.select(pl.col(pk).max()).item())
                     feature_store.io.write_delta(
                         pl.concat([old_features, new_rows], how="vertical_relaxed").lazy().sort(feature_store.sort_keys),
                         feature_store.get_path(table_addr),
@@ -391,7 +410,7 @@ def update_feature_tables(
                 )
 
         return (
-            table_metadata_row(table_addr, input_comparable_max).to_arrow(),
+            table_metadata_row(table_addr, effective_last_updated).to_arrow(),
             feature_metadata_row.to_arrow() if feature_metadata_row is not None else None,
         )
 
